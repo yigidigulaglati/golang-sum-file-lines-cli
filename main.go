@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/urfave/cli/v3"
@@ -41,6 +42,7 @@ func validateDirs(dirs []string) error {
 		if !tempDir.IsDir() {
 			fmt.Println(`Directory validation error at value:`, dir, `.`, `index:`, index)
 			fmt.Println(`Value`, dir, `is not a directory.`)
+			return errors.New(`not a directory`);
 		}
 	}
 
@@ -56,7 +58,6 @@ func readLineCount(f *os.File) (int, error) {
 	for {
 		n, err := f.Read(buf)
 		count += bytes.Count(buf[:n], []byte{'\n'})
-
 		if err != nil {
 			if err == io.EOF {
 				return count, nil
@@ -69,49 +70,68 @@ func readLineCount(f *os.File) (int, error) {
 
 func handleRecDirs(dirs []string) int {
 	var sum = 0
-	var tempSum int
-	var fileHandle *os.File
+	sumChan := make(chan int, len(dirs));
+	var wg sync.WaitGroup;
+	
 	for _, dir := range dirs {
+	
+		wg.Add(1);
+		go func(dir string) {
+			defer wg.Done();
 
-		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				if d.IsDir() && errors.Is(err, os.ErrPermission) {
-					fmt.Println(`Permission error at`, path, `Error:`, err.Error())
-					fmt.Println(`Skipping this directory.`)
-					return filepath.SkipDir
+			var fileHandle *os.File;
+			var tempTotal = 0;
+			var tempLines int;
+
+			
+			filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+				if err != nil {
+					if d.IsDir() && errors.Is(err, os.ErrPermission) {
+						fmt.Println(`Permission error at`, path, `Error:`, err.Error())
+						fmt.Println(`Skipping this directory.`)
+						return filepath.SkipDir
+					}
+					fmt.Println(`Error at file or directory:`, path, `Error:`, err.Error())
+					return nil
 				}
-				fmt.Println(`Error at file or directory:`, path, `Error:`, err.Error())
-				return nil
-			}
 
-			if d.IsDir() {
-				return nil
-			}
-			
-			
-			absPath, err := filepath.Abs(path);
-			if err != nil {
-				fmt.Println(`Could not get the absolute path for this path:`, path, `Error:`, err);
-				return nil;
-			}
-			
-			fileHandle, err = os.OpenFile(absPath, os.O_RDONLY, 0400)
-			
-			if err != nil {
-				fmt.Println(`Could not open file:`, absPath, `Error:`, err.Error())
-				return nil
-			}
+				if d.IsDir() {
+					return nil
+				}
 
-			tempSum, err = readLineCount(fileHandle)
-			
-			sum += tempSum
-			if err != nil {
-				fmt.Println(`An error occurred reading file:`, absPath, `Error:`, err.Error())
-				return nil
-			}
+				absPath, err := filepath.Abs(path)
+				if err != nil {
+					fmt.Println(`Could not get the absolute path for this path:`, path, `Error:`, err)
+					return nil
+				}
 
-			return nil
-		})
+				fileHandle, err = os.OpenFile(absPath, os.O_RDONLY, 0400)
+
+				if err != nil {
+					fmt.Println(`Could not open file:`, absPath, `Error:`, err.Error())
+					return nil
+				}
+
+				tempLines, err = readLineCount(fileHandle)
+
+				tempTotal += tempLines; 
+				if err != nil {
+					fmt.Println(`An error occurred reading file:`, absPath, `Error:`, err.Error())
+					return nil
+				}
+
+				return nil
+			})
+
+			sumChan <- tempTotal;
+		}(dir);
+	}
+
+	wg.Wait();
+	close(sumChan);
+
+	for val := range sumChan{
+		sum += val;
 	}
 
 	return sum
@@ -119,47 +139,69 @@ func handleRecDirs(dirs []string) int {
 
 func handleDirs(dirs []string) int {
 
-	var names []os.DirEntry
-	var err error
-	var sum = 0
-	var tempSum int
-	var fileHandle *os.File
-	var absPath string;
+	var sumChan = make(chan int, len(dirs));
+	var wg sync.WaitGroup;
+
 	for _, dir := range dirs {
-		names, err = os.ReadDir(dir)
+
+		wg.Add(1);
+		go func(dir string) {
+			defer wg.Done();
+
+			var sum = 0
+			var tempSum int
+			var fileHandle *os.File
+			var absPath string;
+			var err error
+			var names []os.DirEntry
+
+			names, err = os.ReadDir(dir)
 		
-		if err != nil {
-			continue
-		}
-
-		for _, dirEntry := range names {
-			absPath, err = filepath.Abs(path.Join(dir, dirEntry.Name()));
-
 			if err != nil {
-				fmt.Println(`Could not get the absolute path for this file:`, dir, dirEntry.Name());
-				continue;
+				fmt.Println(`Could not read directory:`, dir, `Error:`, err);
+				return;
 			}
 
-			if dirEntry.IsDir() {
-				continue
-			}
-			
-			fileHandle, err = os.OpenFile(absPath, os.O_RDONLY, 0400)
+			for _, dirEntry := range names {
+				absPath, err = filepath.Abs(path.Join(dir, dirEntry.Name()));
 
-			if err != nil {
-				fmt.Println(`Could not open the file:`, absPath, `Error:`, err.Error())
-				continue
+				if err != nil {
+					fmt.Println(`Could not get the absolute path for this file:`, dir, dirEntry.Name());
+					continue;
+				}
+
+				if dirEntry.IsDir() {
+					continue
+				}
+				
+				fileHandle, err = os.Open(absPath);
+
+				if err != nil {
+					fmt.Println(`Could not open the file:`, absPath, `Error:`, err.Error())
+					continue
+				}
+
+				tempSum, err = readLineCount(fileHandle)
+				sum += tempSum
+				if err != nil {
+					fmt.Println(`Error reading file:`, absPath, `Error:`, err.Error())
+				}
 			}
 
-			tempSum, err = readLineCount(fileHandle)
-			sum += tempSum
-			if err != nil {
-				fmt.Println(`Error reading file:`, absPath, `Error:`, err.Error())
-			}
-		}
+			sumChan <- sum;
+		}(dir);		
 	}
 
-	return sum
+	wg.Wait();
+	close(sumChan);
+
+	var total = 0;
+
+	for val := range sumChan{
+		total += val;
+	}
+
+	return total;
 }
 
 func handleFiles(files []string) int {
@@ -168,12 +210,13 @@ func handleFiles(files []string) int {
 	var sum = 0
 	var tempSum int
 	var err error
-	var absPath string;
+	var absPath string
+
 	for _, file := range files {
-		absPath, err = filepath.Abs(file);
+		absPath, err = filepath.Abs(file)
 		if err != nil {
-			fmt.Println(`Could not get the absolute path for this file:`, file);
-			continue;
+			fmt.Println(`Could not get the absolute path for this file:`, file)
+			continue
 		}
 
 		fileHandle, err = os.Open(absPath)
@@ -202,12 +245,14 @@ func main() {
 
 	cmd := &cli.Command{
 
+		
 		Name:      `cl`,
 		Version:   `1.0`,
 		Usage:     `Sum the lines of files.`,
 		UsageText: `Sum the lines of; files inside given directories (recursively and/or non-recursively) and/or given files.`,
 
 		Flags: []cli.Flag{
+
 			&cli.StringSliceFlag{
 				Name:        `rdir`,
 				Aliases:     []string{`rd`},
@@ -221,7 +266,7 @@ func main() {
 				Validator: func(dirs []string) error {
 					err := validateDirs(dirs)
 					if err != nil {
-						return err
+						return cli.Exit(err.Error(), 1);
 					}
 					return nil
 				},
@@ -241,7 +286,7 @@ func main() {
 				Validator: func(dirs []string) error {
 					err := validateDirs(dirs)
 					if err != nil {
-						return err
+						return cli.Exit(err.Error(), 1);
 					}
 					return nil
 				},
@@ -268,7 +313,7 @@ func main() {
 						if err != nil {
 							fmt.Println(`Could not get the absolute file path for the file:`, file, `index:`, index)
 							fmt.Println(`Error:`, err.Error())
-							return err
+							return cli.Exit(err.Error(), 1);
 						}
 
 						fileStat, err = os.Stat(absFilePath)
@@ -277,12 +322,12 @@ func main() {
 							if os.IsNotExist(err) {
 								fmt.Println(`File does not exist.`, `Error:`, err.Error())
 							}
-							return err
+							return cli.Exit(err.Error(), 1);
 						}
 
 						if fileStat.IsDir() {
 							fmt.Println(`Value:`, file, `is a directory, not a file.`, `index:`, index)
-							return err
+							return cli.Exit(``, 1);
 						}
 					}
 					return nil
@@ -291,11 +336,37 @@ func main() {
 		},
 
 		Action: func(ctx context.Context, c *cli.Command) error {
-			start := time.Now();
-			TOTAL += handleDirs(dirs)
-			TOTAL += handleRecDirs(recDirs)
-			TOTAL += handleFiles(files)
-			fmt.Println(`Time taken: `, time.Since(start));
+
+			start := time.Now()
+			sumChan := make(chan int, 3);
+			var wg sync.WaitGroup;
+
+			wg.Add(1);
+			go func() {
+				defer wg.Done();
+				sumChan <- handleDirs(dirs)
+			}()
+
+			wg.Add(1);
+			go func() {
+				defer wg.Done();
+				sumChan <- handleRecDirs(recDirs)
+			}()
+
+			wg.Add(1);
+			go func() {
+				defer wg.Done();
+				sumChan <- handleFiles(files)
+			}()
+
+			wg.Wait();
+			close(sumChan);
+
+			for val := range sumChan{
+				TOTAL += val;
+			}
+
+			fmt.Println(`Time taken: `, time.Since(start))
 			fmt.Println(`TOTAL LINES:`, TOTAL)
 
 			return nil
